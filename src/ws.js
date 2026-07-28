@@ -30,6 +30,14 @@ export function connectedCount() {
   return n;
 }
 
+/** O Resenha Client desse jogador está conectado agora? */
+export function isConnected(steamid) {
+  const set = clients.get(steamid);
+  if (!set) return false;
+  for (const ws of set) if (ws.readyState === ws.OPEN) return true;
+  return false;
+}
+
 export function attachWebSocket(server) {
   // Um STATE_SYNC tem ~1 KB; 64 KB é folga generosa. Sem esse teto o default
   // do ws é 100 MiB por mensagem — um client malicioso incharia o banco.

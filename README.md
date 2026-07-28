@@ -59,7 +59,9 @@ dono registra o placar (status 'finalizado')
 | `WS /ws/client` | `Authorization: Bearer <access>` (401 se expirado — o client renova sozinho) | conexão persistente do client |
 | `POST /internal/match/start` `{ code }` | `X-Internal-Key` | site avisa que o veto terminou → `START_MATCH` pros 10 clients |
 | `POST /internal/match/end` `{ code }` | `X-Internal-Key` | site avisa que o placar foi registrado → `END_MATCH` |
-| `GET /internal/match/:id/state` | `X-Internal-Key` | estado ao vivo (último `STATE_SYNC` de cada jogador) |
+| `GET /internal/match/:id/state` | `X-Internal-Key` | estado ao vivo agregado (placar já traduzido pros times A/B + K/D/A por jogador) |
+| `GET /internal/lobby/:code/state` | `X-Internal-Key` | igual ao anterior, mas pelo código do lobby (é o que o site usa) |
+| `POST /internal/sweep` | `X-Internal-Key` | encerra partidas abandonadas na hora (roda sozinho de hora em hora) |
 | `GET /health` | — | liveness + nº de clients conectados |
 
 ## Garantias implementadas (contrato do client)
@@ -80,10 +82,42 @@ dono registra o placar (status 'finalizado')
 - `live_matches` — partidas em andamento (`id` é o `matchId` do client)
 - `match_events` — eventos crus (`ROUND_END`, `PLAYER_KILL`, `STATE_SYNC`…)
 
+## Placar ao vivo
+
+`liveState()` junta o último `STATE_SYNC` de cada jogador com os times do
+lobby e **traduz o placar CT/T do CS2 pros times A/B da plataforma**. Como os
+lados trocam no halftime, o lado de cada time é descoberto por voto da maioria
+dos `player.team` que os próprios clients reportam — se ninguém reportou (ou
+deu empate), `score_a`/`score_b` vêm `null` e o site mostra "esperando dados".
+
+O site consome via proxy (`GET /api/lobby/:code/live`, que valida se você está
+no lobby e guarda a chave interna no servidor).
+
+## Testes
+
+```
+node --env-file=.env test-flow.mjs        # pareamento, tokens, WS, START/END_MATCH
+node --env-file=.env test-live.mjs        # agregação do placar, inclusive troca de lado
+node --env-file=.env test-abandonada.mjs  # rede de segurança contra END_MATCH perdido
+```
+
+Todos usam steamids falsos (`7656119800000000…`) e limpam tudo no final.
+
+## Rede de segurança: partidas abandonadas
+
+Se o `END_MATCH` se perder (site sem internet na hora de registrar o placar,
+por exemplo), a partida ficaria `ativa` pra sempre e os clients continuariam
+coletando — inclusive em Premier/Casual, exatamente o que a plataforma promete
+não monitorar. Por isso:
+
+- partidas com mais de **4h** são ignoradas no resync e nos eventos recebidos;
+- uma varredura (no boot e de hora em hora) marca essas partidas como
+  `abandonada` e manda `END_MATCH` pros clients;
+- `POST /internal/sweep` roda a varredura na hora (usado pelo teste).
+
 ## Próximos passos (não implementados)
 
-- Preencher o placar do site automaticamente no `GAME_OVER` (hoje o dono ainda
-  registra manualmente — o backend só grava os eventos).
-- Mapear CT/T → time A/B usando os eventos `PLAYER_TEAM` pra montar scoreboard.
-- Página de partida ao vivo no site consumindo `GET /internal/match/:id/state`
-  (via rota proxy no Next, que guarda a chave interna).
+- Registrar o placar sozinho no `GAME_OVER`: hoje o site **sugere** o placar
+  detectado e o dono confirma com um clique (o elo só muda no clique, de
+  propósito — evita mexer no ranking de todo mundo por um evento perdido).
+- Histórico round a round (os eventos já estão em `match_events`).

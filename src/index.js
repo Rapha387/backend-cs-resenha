@@ -9,7 +9,7 @@
 //   WS   /ws/client                 conexão persistente do Resenha Client
 import http from 'http';
 import { pair, refresh, HttpError } from './auth.js';
-import { startMatch, endMatch, liveState } from './matches.js';
+import { startMatch, endMatch, liveState, liveStateByCode, encerrarPartidasAbandonadas } from './matches.js';
 import { attachWebSocket, connectedCount } from './ws.js';
 import { rateLimit } from './ratelimit.js';
 import { log } from './log.js';
@@ -91,6 +91,15 @@ const server = http.createServer(async (req, res) => {
       requireInternalKey(req);
       return json(res, 200, await liveState(Number(stateMatch[1])));
     }
+    const stateLobby = /^\/internal\/lobby\/([A-Za-z0-9]{1,10})\/state$/.exec(pathname);
+    if (req.method === 'GET' && stateLobby) {
+      requireInternalKey(req);
+      return json(res, 200, await liveStateByCode(stateLobby[1]));
+    }
+    if (req.method === 'POST' && pathname === '/internal/sweep') {
+      requireInternalKey(req);
+      return json(res, 200, { encerradas: await encerrarPartidasAbandonadas() });
+    }
     if (req.method === 'GET' && pathname === '/health') {
       return json(res, 200, { ok: true, clients: connectedCount() });
     }
@@ -107,3 +116,9 @@ attachWebSocket(server);
 server.listen(PORT, () => {
   log(`resenha-backend ouvindo em :${PORT} (REST + WS /ws/client)`);
 });
+
+// Rede de segurança: se um END_MATCH se perdeu, a partida não pode ficar
+// "ativa" pra sempre — o client continuaria coletando fora da plataforma.
+const varrer = () => encerrarPartidasAbandonadas().catch((e) => log('varredura falhou:', e.message));
+varrer();
+setInterval(varrer, 60 * 60 * 1000).unref();
