@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: resenha-backend
+    env: node
+    region: ohio
+    plan: starter
+    buildCommand: cd resenha-backend && npm install
+    startCommand: cd resenha-backend && npm start
+    envVars:
+      - key: PORT
+        value: 4000
+      - key: TRUST_PROXY
+        value: 1
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      - key: INTERNAL_API_KEY
+        sync: false
