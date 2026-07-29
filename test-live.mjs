@@ -36,6 +36,7 @@ async function cleanup(matchId) {
     { sql: 'DELETE FROM lobby_players WHERE code = ?', args: [LOBBY] },
     { sql: 'DELETE FROM lobbies WHERE code = ?', args: [LOBBY] },
     { sql: 'DELETE FROM live_matches WHERE code = ?', args: [LOBBY] },
+    { sql: 'DELETE FROM matches WHERE code = ?', args: [LOBBY] },
     { sql: 'DELETE FROM players WHERE steamid IN (?, ?, ?)', args: [A1, A2, B1] },
   ];
   if (matchId) stmts.push({ sql: 'DELETE FROM match_events WHERE match_id = ?', args: [matchId] });
@@ -148,6 +149,39 @@ try {
   const fim = await get(`/internal/lobby/${LOBBY}/state`);
   check('GAME_OVER → finished', fim.data.finished === true);
   check('placar final continua A=13 B=11', fim.data.score_a === 13 && fim.data.score_b === 11);
+
+  // ---- Registro automático via varredura (retry) ----
+  // O GAME_OVER acima foi inserido direto no banco (sem WS), então o gatilho
+  // imediato não rodou — é exatamente o cenário que o retry da varredura cobre.
+  const sweep = await fetch(`${BASE}/internal/sweep`, {
+    method: 'POST', headers: { 'X-Internal-Key': KEY },
+  }).then((r) => r.json());
+  check('varredura registra placar pendente', sweep.encerradas >= 1, `encerradas=${sweep.encerradas}`);
+
+  const lob = await db.execute({ sql: 'SELECT status FROM lobbies WHERE code = ?', args: [LOBBY] });
+  check("lobby virou 'finalizado'", lob.rows[0][0] === 'finalizado', `status=${lob.rows[0][0]}`);
+
+  const elos = await db.execute({
+    sql: 'SELECT steamid, elo, wins, losses FROM players WHERE steamid IN (?, ?, ?) ORDER BY steamid',
+    args: [A1, A2, B1],
+  });
+  const porId = new Map(elos.rows.map((r) => [r[0], { elo: Number(r[1]), w: Number(r[2]), l: Number(r[3]) }]));
+  check('time A ganhou +25 de elo', porId.get(A1).elo === 1025 && porId.get(A2).elo === 1025
+    && porId.get(A1).w === 1 && porId.get(A2).w === 1);
+  check('time B perdeu 25 de elo', porId.get(B1).elo === 975 && porId.get(B1).l === 1);
+
+  const reg = await db.execute({ sql: 'SELECT score_a, score_b, winner FROM matches WHERE code = ?', args: [LOBBY] });
+  check('histórico em matches (13x11, vencedor A)',
+    reg.rows.length === 1 && Number(reg.rows[0][0]) === 13 && Number(reg.rows[0][1]) === 11 && reg.rows[0][2] === 'A');
+
+  const lmSt = await db.execute({ sql: 'SELECT status FROM live_matches WHERE id = ?', args: [matchId] });
+  check("live_match virou 'encerrada'", lmSt.rows[0][0] === 'encerrada', `status=${lmSt.rows[0][0]}`);
+
+  // Idempotência: rodar a varredura de novo não duplica nada
+  await fetch(`${BASE}/internal/sweep`, { method: 'POST', headers: { 'X-Internal-Key': KEY } });
+  const reg2 = await db.execute({ sql: 'SELECT COUNT(*) c FROM matches WHERE code = ?', args: [LOBBY] });
+  const elo2 = await db.execute({ sql: 'SELECT elo FROM players WHERE steamid = ?', args: [A1] });
+  check('varredura repetida não duplica registro', Number(reg2.rows[0][0]) === 1 && Number(elo2.rows[0][0]) === 1025);
 
   // Lobby sem partida → 404 (o site trata como "sem placar ao vivo")
   const semPartida = await get('/internal/lobby/NAOEX/state', { fresco: false });

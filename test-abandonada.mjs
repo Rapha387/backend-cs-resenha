@@ -95,6 +95,12 @@ try {
   });
   check("status virou 'abandonada'", status.rows[0][0] === 'abandonada', `status=${status.rows[0][0]}`);
 
+  // Sem o registro manual, um lobby 'pronto' de partida abandonada não teria
+  // mais NENHUM caminho pra sair desse estado — a varredura fecha ele junto.
+  const lobAbd = await db.execute({ sql: 'SELECT status FROM lobbies WHERE code = ?', args: [LOBBY] });
+  check("lobby fechado junto (status 'abandonado')", lobAbd.rows[0][0] === 'abandonado',
+    `status=${lobAbd.rows[0][0]}`);
+
   // END_MATCH perdido na hibernação: partida recente ainda 'ativa', mas o
   // lobby já está 'finalizado' no site (o /internal/match/end não chegou
   // porque o backend dormia). A varredura do boot precisa encerrar.

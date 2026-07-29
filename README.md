@@ -45,9 +45,10 @@ veto termina (status 'pronto')
                                   ◀── eventos da partida ───────  (rounds, kills, bomba…)
                                       grava em match_events
 
-dono registra o placar (status 'finalizado')
-  └─▶ POST /internal/match/end ────▶ encerra live_match
-                                  ──▶ END_MATCH ───────────────▶  volta ao modo espera
+GAME_OVER chega do CS2 ──▶ registro automático do placar:
+                             elo/W-L nos players, histórico em matches,
+                             lobby vira 'finalizado', encerra live_match
+                          ──▶ END_MATCH ──────────────────────▶  volta ao modo espera
 ```
 
 ## Rotas
@@ -58,7 +59,7 @@ dono registra o placar (status 'finalizado')
 | `POST /api/client/auth/refresh` `{ refresh_token }` | — | rotaciona o par de tokens (access expira em 1h; refresh em 90 dias) |
 | `WS /ws/client` | `Authorization: Bearer <access>` (401 se expirado — o client renova sozinho) | conexão persistente do client |
 | `POST /internal/match/start` `{ code }` | `X-Internal-Key` | site avisa que o veto terminou → `START_MATCH` pros 10 clients |
-| `POST /internal/match/end` `{ code }` | `X-Internal-Key` | site avisa que o placar foi registrado → `END_MATCH` |
+| `POST /internal/match/end` `{ code }` | `X-Internal-Key` | encerra a coleta manualmente → `END_MATCH` (normalmente o registro automático faz isso sozinho) |
 | `GET /internal/match/:id/state` | `X-Internal-Key` | estado ao vivo agregado (placar já traduzido pros times A/B + K/D/A por jogador) |
 | `GET /internal/lobby/:code/state` | `X-Internal-Key` | igual ao anterior, mas pelo código do lobby (é o que o site usa) |
 | `POST /internal/sweep` | `X-Internal-Key` | encerra partidas abandonadas na hora (roda sozinho de hora em hora) |
@@ -103,17 +104,23 @@ node --env-file=.env test-abandonada.mjs  # rede de segurança contra END_MATCH 
 
 Todos usam steamids falsos (`7656119800000000…`) e limpam tudo no final.
 
-## Rede de segurança: partidas abandonadas
+## Rede de segurança: a varredura
 
-Se o `END_MATCH` se perder (site sem internet na hora de registrar o placar,
-por exemplo), a partida ficaria `ativa` pra sempre e os clients continuariam
-coletando — inclusive em Premier/Casual, exatamente o que a plataforma promete
-não monitorar. Por isso:
+Sem ela, uma partida cujo fim nunca foi detectado (ninguém com o client
+aberto, empate sem replay, erro transitório no registro) ficaria `ativa` pra
+sempre e os clients continuariam coletando — inclusive em Premier/Casual,
+exatamente o que a plataforma promete não monitorar. A varredura roda no boot
+(toda acordada do plano free) e de hora em hora, em três passos:
 
-- partidas com mais de **4h** são ignoradas no resync e nos eventos recebidos;
-- uma varredura (no boot e de hora em hora) marca essas partidas como
-  `abandonada` e manda `END_MATCH` pros clients;
-- `POST /internal/sweep` roda a varredura na hora (usado pelo teste).
+- **retry do registro automático**: partida ativa de lobby `pronto` que já
+  terminou → registra o placar (elo, histórico, lobby `finalizado`);
+- **END_MATCH perdido**: partida ativa de lobby já `finalizado` → encerra a
+  coleta e avisa os clients;
+- **abandono após 4h**: partida sem fim detectável → vira `abandonada`, o
+  lobby fecha junto (status `abandonado`, sem elo) e os clients recebem
+  `END_MATCH`. Partidas velhas também são ignoradas no resync e nos eventos.
+
+`POST /internal/sweep` roda a varredura na hora (usado pelos testes).
 
 ## Próximos passos (não implementados)
 

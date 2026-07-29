@@ -87,6 +87,26 @@ async function activeMatchFor(steamid) {
  * a coleta. Roda no boot e de hora em hora.
  */
 export async function encerrarPartidasAbandonadas() {
+  // Caso 0 — retry do registro automático: a partida terminou mas o registro
+  // não completou na hora (erro transitório, placar sem tradução no momento,
+  // ou o fim só apareceu num STATE_SYNC com map_phase 'gameover' — client que
+  // reconectou já na tela de placar, sem ter visto a virada). Tenta em TODA
+  // partida ativa de lobby 'pronto': o registrarPlacar sai de graça quando a
+  // partida ainda não terminou. Roda antes dos outros casos: se registrar, a
+  // partida sai de 'ativa' e o lobby vira 'finalizado' — não cai nos casos 1 e 2.
+  const pendentes = await db.prepare(`
+    SELECT lm.id FROM live_matches lm
+    JOIN lobbies l ON l.code = lm.code
+    WHERE lm.status = 'ativa' AND l.status = 'pronto'`).all();
+  let registradas = 0;
+  for (const m of pendentes) {
+    try {
+      if (await registrarPlacar(Number(m.id))) registradas++;
+    } catch (e) {
+      log(`retry do registro automático da partida #${m.id} falhou:`, e.message);
+    }
+  }
+
   // Caso 1 — END_MATCH perdido na hibernação: o placar já foi registrado no
   // site (lobby 'finalizado'), mas o /internal/match/end não chegou porque o
   // backend estava dormindo (plano free do Render) e o cold start estourou o
@@ -98,8 +118,10 @@ export async function encerrarPartidasAbandonadas() {
     JOIN lobbies l ON l.code = lm.code
     WHERE lm.status = 'ativa' AND l.status = 'finalizado'`).all();
   if (perdidas.length > 0) {
+    // "AND status = 'ativa'": um GAME_OVER pode chegar via WS entre o SELECT
+    // acima e este UPDATE — quem já foi encerrado não é tocado de novo.
     await db.batch(perdidas.map((m) => ({
-      sql: "UPDATE live_matches SET status = 'encerrada', ended = ? WHERE id = ?",
+      sql: "UPDATE live_matches SET status = 'encerrada', ended = ? WHERE id = ? AND status = 'ativa'",
       args: [Date.now(), m.id],
     })));
     for (const m of perdidas) {
@@ -116,12 +138,24 @@ export async function encerrarPartidasAbandonadas() {
   const velhas = await db.prepare(
     "SELECT id, code FROM live_matches WHERE status = 'ativa' AND started <= ?"
   ).all(limite);
-  if (velhas.length === 0) return perdidas.length;
+  if (velhas.length === 0) return registradas + perdidas.length;
 
-  await db.batch(velhas.map((m) => ({
-    sql: "UPDATE live_matches SET status = 'abandonada', ended = ? WHERE id = ?",
-    args: [Date.now(), m.id],
-  })));
+  // O lobby também é fechado (status 'abandonado'): sem o registro manual não
+  // existe mais nenhum caminho de 'pronto' pra 'finalizado' nesses casos —
+  // ninguém jogou com o client aberto, ou deu empate sem replay. Sem isso o
+  // lobby ficava 'pronto' pra sempre, com o site fazendo polling à toa.
+  await db.batch([
+    ...velhas.map((m) => ({
+      // Mesma guarda do caso 1: não sobrescreve partida que acabou de ser
+      // encerrada por um registro que chegou no meio da varredura.
+      sql: "UPDATE live_matches SET status = 'abandonada', ended = ? WHERE id = ? AND status = 'ativa'",
+      args: [Date.now(), m.id],
+    })),
+    ...velhas.map((m) => ({
+      sql: "UPDATE lobbies SET status = 'abandonado' WHERE code = ? AND status = 'pronto'",
+      args: [m.code],
+    })),
+  ]);
 
   for (const m of velhas) {
     for (const p of await lobbyPlayers(m.code)) {
@@ -130,7 +164,75 @@ export async function encerrarPartidasAbandonadas() {
     }
   }
   log(`${velhas.length} partida(s) abandonada(s) encerrada(s): ${velhas.map((m) => m.code).join(', ')}`);
-  return perdidas.length + velhas.length;
+  return registradas + perdidas.length + velhas.length;
+}
+
+// Mesmo K do elo que o site usava no registro manual.
+const K_ELO = 25;
+
+/**
+ * Registro automático do placar — dispara no GAME_OVER (e na varredura, como
+ * retry). Traduz o placar CT/T pros times A/B, aplica elo/vitórias/derrotas,
+ * grava o histórico em `matches` e finaliza o lobby.
+ *
+ * Até 10 clients mandam GAME_OVER quase juntos (um por jogador): cada
+ * statement do batch é condicionado a lobbies.status = 'pronto' DENTRO da
+ * transação, então só o primeiro aplica — os outros viram no-op completo.
+ *
+ * Retorna true se ESTE chamador registrou (e aí encerra a coleta também).
+ */
+export async function registrarPlacar(matchId) {
+  // buildLiveState direto, sem o cache de 2s: precisa enxergar o GAME_OVER
+  // que acabou de ser gravado.
+  const live = await buildLiveState(matchId);
+  if (!live.finished) return false;
+  const code = live.match.code;
+
+  const lobby = await db.prepare('SELECT * FROM lobbies WHERE code = ?').get(code);
+  if (!lobby || lobby.status !== 'pronto') return false; // já registrado
+
+  if (live.score_a === null || live.score_b === null) {
+    // Sem voto de lado (ninguém com client reportando team) não dá pra saber
+    // qual placar é de quem. A varredura tenta de novo; se nunca resolver,
+    // a partida cai na rede de segurança de 4h.
+    log(`partida #${matchId} (${code}) terminou mas o placar não pôde ser traduzido — registro adiado`);
+    return false;
+  }
+  if (live.score_a === live.score_b) {
+    log(`partida #${matchId} (${code}) terminou empatada (${live.score_a}x${live.score_b}) — empate não registra`);
+    return false;
+  }
+
+  const winner = live.score_a > live.score_b ? 'A' : 'B';
+  const teams = await db.prepare('SELECT steamid, team FROM lobby_players WHERE code = ?').all(code);
+  const guarda = "(SELECT status FROM lobbies WHERE code = ?) = 'pronto'";
+  const statements = teams
+    .filter((t) => t.team)
+    .map((t) => ({
+      sql: `UPDATE players SET elo = MAX(0, elo + ?), wins = wins + ?, losses = losses + ?
+        WHERE steamid = ? AND ${guarda}`,
+      args: t.team === winner ? [K_ELO, 1, 0, t.steamid, code] : [-K_ELO, 0, 1, t.steamid, code],
+    }));
+  statements.push({
+    sql: `INSERT INTO matches (code, map, score_a, score_b, winner, teams_json, played_at)
+      SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${guarda}`,
+    args: [code, live.map ?? lobby.decider_map, live.score_a, live.score_b, winner,
+      JSON.stringify(teams), Date.now(), code],
+  });
+  // Por último: virar o status é o que desarma a guarda dos concorrentes.
+  statements.push({
+    sql: "UPDATE lobbies SET status = 'finalizado' WHERE code = ? AND status = 'pronto'",
+    args: [code],
+  });
+  const results = await db.batch(statements);
+
+  // rowsAffected do UPDATE final diz se ESTE chamador ganhou a corrida.
+  const registrou = Number(results[results.length - 1]?.rowsAffected ?? 0) > 0;
+  if (registrou) {
+    log(`placar registrado automaticamente: ${code} ${live.score_a}x${live.score_b} (vencedor: time ${winner})`);
+    await endMatch({ code }); // encerra a coleta e manda END_MATCH pros clients
+  }
+  return registrou;
 }
 
 /** Contrato do client: após o HELLO, reenviamos o estado atual. */
@@ -173,6 +275,16 @@ export async function handleClientEvent(steamid, msg) {
   }
   await db.prepare('INSERT INTO match_events (match_id, steamid, type, ts, data) VALUES (?, ?, ?, ?, ?)')
     .run(expected, steamid, msg.type, Number(msg.timestamp) || Date.now(), data);
+
+  // Fim de jogo detectado no CS2 → registra o placar sozinho. Se falhar aqui
+  // (erro transitório), a varredura tenta de novo — nada de perder o registro.
+  if (msg.type === 'GAME_OVER') {
+    try {
+      await registrarPlacar(expected);
+    } catch (e) {
+      log(`registro automático da partida #${expected} falhou (varredura vai tentar de novo):`, e.message);
+    }
+  }
 }
 
 const parse = (raw) => { try { return JSON.parse(raw); } catch { return null; } };
@@ -283,8 +395,12 @@ async function buildLiveState(matchId) {
   }
   const ladoA = votos.CT === votos.T ? null : (votos.CT > votos.T ? 'CT' : 'T');
 
-  const scoreCt = g.score_ct ?? null;
-  const scoreT = g.score_t ?? null;
+  // O placar do STATE_SYNC pode estar até 10s atrasado (intervalo do sync).
+  // No fim de jogo o GAME_OVER traz o placar capturado na hora exata — é ele
+  // que vale, senão o último round podia ficar de fora do resultado.
+  const overData = over ? parse(over.data) : null;
+  const scoreCt = overData?.score_ct ?? g.score_ct ?? null;
+  const scoreT = overData?.score_t ?? g.score_t ?? null;
   const temPlacar = ladoA !== null && scoreCt !== null && scoreT !== null;
 
   return {

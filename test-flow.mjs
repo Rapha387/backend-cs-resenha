@@ -55,6 +55,8 @@ async function cleanup() {
     { sql: 'DELETE FROM live_matches WHERE code = ?', args: [LOBBY] },
     { sql: 'DELETE FROM lobby_players WHERE code = ?', args: [LOBBY] },
     { sql: 'DELETE FROM lobbies WHERE code = ?', args: [LOBBY] },
+    { sql: 'DELETE FROM matches WHERE code = ?', args: [LOBBY] },
+    { sql: 'DELETE FROM players WHERE steamid = ?', args: [STEAMID] },
   ], 'write');
 }
 
@@ -158,6 +160,53 @@ try {
   await sleep(2300); // > CACHE_MS do liveState, senão a resposta vem do cache
   const caiu = await req(`/internal/match/${start.data.matchId}/state`, { method: 'GET', headers: { 'X-Internal-Key': KEY } });
   check('queda curta não vira "client fechado"', caiu.data.players[0].client_online === true);
+
+  // ---- Registro automático do placar via GAME_OVER (fluxo real do client) ----
+  // O lobby continua 'pronto' (endMatch não mexe no lobby); cria o jogador na
+  // tabela players (elo/W-L são atualizados no registro) e uma partida nova.
+  await db.execute({
+    sql: 'INSERT INTO players (steamid, name, elo, wins, losses, created) VALUES (?, ?, 1000, 0, 0, ?)',
+    args: [STEAMID, 'Testador', Date.now()],
+  });
+  const conn2 = await wsConnect(ref.data.access_token);
+  check('WS reconecta pro teste de registro', conn2.status === 101);
+
+  const start3 = await req('/internal/match/start', { body: { code: LOBBY }, headers: { 'X-Internal-Key': KEY } });
+  const mid3 = start3.data.matchId;
+  check('nova partida criada', Number.isInteger(mid3) && mid3 !== start.data.matchId, `matchId=${mid3}`);
+
+  // STATE_SYNC dá o voto de lado (jogador do time A jogando de CT)…
+  conn2.ws.send(JSON.stringify({
+    type: 'STATE_SYNC', matchId: mid3, timestamp: Date.now(),
+    data: { map: 'de_mirage', round: 21, round_phase: 'over', map_phase: 'live', score_ct: 12, score_t: 9,
+      player: { steamid: STEAMID, name: 'Testador', team: 'CT', health: 100, kills: 20, deaths: 5, assists: 3, mvps: 2 } },
+  }));
+  await sleep(600);
+  // …e o GAME_OVER traz o placar final da hora exata (13x9, um round além do
+  // último sync — é ele que tem que valer no registro).
+  conn2.ws.send(JSON.stringify({
+    type: 'GAME_OVER', matchId: mid3, timestamp: Date.now(),
+    data: { score_ct: 13, score_t: 9 },
+  }));
+  await sleep(1200);
+
+  const lobFinal = await db.execute({ sql: 'SELECT status FROM lobbies WHERE code = ?', args: [LOBBY] });
+  check("GAME_OVER → lobby 'finalizado' sozinho", lobFinal.rows[0][0] === 'finalizado', `status=${lobFinal.rows[0][0]}`);
+
+  const jog = await db.execute({ sql: 'SELECT elo, wins, losses FROM players WHERE steamid = ?', args: [STEAMID] });
+  check('elo aplicado automaticamente (+25)', Number(jog.rows[0][0]) === 1025 && Number(jog.rows[0][1]) === 1,
+    `elo=${jog.rows[0][0]} wins=${jog.rows[0][1]}`);
+
+  const reg = await db.execute({ sql: 'SELECT score_a, score_b, winner, map FROM matches WHERE code = ?', args: [LOBBY] });
+  check('histórico gravado com o placar do GAME_OVER (13x9, não 12x9)',
+    reg.rows.length === 1 && Number(reg.rows[0][0]) === 13 && Number(reg.rows[0][1]) === 9 && reg.rows[0][2] === 'A',
+    `${reg.rows[0]?.[0]}x${reg.rows[0]?.[1]} winner=${reg.rows[0]?.[2]}`);
+
+  const lm3 = await db.execute({ sql: 'SELECT status FROM live_matches WHERE id = ?', args: [mid3] });
+  check("coleta encerrada (live_match 'encerrada')", lm3.rows[0][0] === 'encerrada', `status=${lm3.rows[0][0]}`);
+  check('client recebeu END_MATCH do registro', conn2.messages.some((m) => m.type === 'END_MATCH'));
+
+  conn2.ws.close();
 } finally {
   await cleanup();
   console.log(falhas === 0 ? '\n🎉 tudo passou' : `\n💥 ${falhas} falha(s)`);

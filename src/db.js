@@ -39,6 +39,18 @@ const SCHEMA = [
     refresh_expires INTEGER NOT NULL,
     created INTEGER
   )`,
+  // Também declarada no site (DDL idêntica): o registro automático do placar
+  // grava o histórico aqui.
+  `CREATE TABLE IF NOT EXISTS matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT,
+    map TEXT,
+    score_a INTEGER,
+    score_b INTEGER,
+    winner TEXT,
+    teams_json TEXT,
+    played_at INTEGER
+  )`,
   // Partidas ao vivo (o matchId que o client recebe no START_MATCH)
   `CREATE TABLE IF NOT EXISTS live_matches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
