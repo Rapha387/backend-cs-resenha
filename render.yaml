@@ -3,7 +3,12 @@ services:
     name: resenha-backend
     env: node
     region: ohio
-    plan: starter
+    # Plano free: o serviço hiberna após ~15 min sem tráfego. O código convive
+    # com isso — o polling do placar segura o backend acordado durante a
+    # partida, o startMatch é idempotente (o site reavisa se o start se perder)
+    # e a varredura do boot encerra partidas cujo lobby já foi finalizado
+    # (END_MATCH perdido no cold start).
+    plan: free
     buildCommand: cd resenha-backend && npm install
     startCommand: cd resenha-backend && npm start
     envVars:

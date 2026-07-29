@@ -9,6 +9,16 @@ import { log } from './log.js';
 // uma reconexão; todas recebem os comandos)
 const clients = new Map();
 
+// steamid -> última vez que vimos o client desse jogador (ms).
+const lastSeen = new Map();
+
+// Uma reconexão (backend reiniciando, wi-fi oscilando, PC saindo do sono) leva
+// alguns segundos — o client refaz o handshake com backoff a partir de 1s.
+// Sem tolerância, cada soluço desses anunciava "Resenha Client fechado" pra
+// sala inteira de uma vez, mesmo com todo mundo jogando: o aviso existe pra
+// quem esqueceu de abrir o app, não pra piscar a cada reconexão.
+const TOLERANCIA_MS = 45_000;
+
 /** Envia um objeto pra todas as conexões de um jogador. Retorna quantas. */
 export function sendTo(steamid, obj) {
   const sockets = clients.get(steamid);
@@ -30,12 +40,16 @@ export function connectedCount() {
   return n;
 }
 
-/** O Resenha Client desse jogador está conectado agora? */
+/**
+ * O Resenha Client desse jogador está de pé? Conta como sim durante uma
+ * reconexão curta (ver TOLERANCIA_MS) — a coleta não se perde nesse intervalo,
+ * o client reenvia o estado assim que volta.
+ */
 export function isConnected(steamid) {
   const set = clients.get(steamid);
-  if (!set) return false;
-  for (const ws of set) if (ws.readyState === ws.OPEN) return true;
-  return false;
+  if (set) for (const ws of set) if (ws.readyState === ws.OPEN) return true;
+  const visto = lastSeen.get(steamid);
+  return visto !== undefined && Date.now() - visto < TOLERANCIA_MS;
 }
 
 export function attachWebSocket(server) {
@@ -70,12 +84,17 @@ export function attachWebSocket(server) {
     const { steamid } = session;
     if (!clients.has(steamid)) clients.set(steamid, new Set());
     clients.get(steamid).add(ws);
+    lastSeen.set(steamid, Date.now());
     log(`client conectado: ${steamid} (${connectedCount()} conexões no total)`);
 
     ws.isAlive = true;
-    ws.on('pong', () => { ws.isAlive = true; });
+    ws.on('pong', () => {
+      ws.isAlive = true;
+      lastSeen.set(steamid, Date.now());
+    });
 
     ws.on('message', async (raw) => {
+      lastSeen.set(steamid, Date.now());
       let msg;
       try {
         msg = JSON.parse(raw.toString());
@@ -93,6 +112,7 @@ export function attachWebSocket(server) {
       const set = clients.get(steamid);
       set?.delete(ws);
       if (set?.size === 0) clients.delete(steamid);
+      lastSeen.set(steamid, Date.now()); // começa a contar a tolerância
       log(`client desconectado: ${steamid}`);
     });
 
@@ -107,6 +127,12 @@ export function attachWebSocket(server) {
         ws.isAlive = false;
         ws.ping();
       }
+    }
+    // Faxina do lastSeen: passada a tolerância de quem já desconectou, a
+    // entrada não muda mais nenhuma resposta.
+    const limite = Date.now() - TOLERANCIA_MS;
+    for (const [steamid, visto] of lastSeen) {
+      if (visto < limite && !clients.has(steamid)) lastSeen.delete(steamid);
     }
   }, 30_000);
   wss.on('close', () => clearInterval(interval));

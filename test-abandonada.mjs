@@ -95,6 +95,31 @@ try {
   });
   check("status virou 'abandonada'", status.rows[0][0] === 'abandonada', `status=${status.rows[0][0]}`);
 
+  // END_MATCH perdido na hibernação: partida recente ainda 'ativa', mas o
+  // lobby já está 'finalizado' no site (o /internal/match/end não chegou
+  // porque o backend dormia). A varredura do boot precisa encerrar.
+  await db.batch([
+    { sql: "UPDATE lobbies SET status = 'finalizado' WHERE code = ?", args: [LOBBY] },
+    { sql: "INSERT INTO live_matches (code, status, started) VALUES (?, 'ativa', ?)", args: [LOBBY, Date.now()] },
+  ], 'write');
+  const endsAntes = recebidas.filter((m) => m.type === 'END_MATCH').length;
+
+  const varrida2 = await fetch(`${BASE}/internal/sweep`, {
+    method: 'POST', headers: { 'X-Internal-Key': KEY },
+  }).then((r) => r.json());
+  check('varredura encerrou a partida com END_MATCH perdido', varrida2.encerradas >= 1,
+    `encerradas=${varrida2.encerradas}`);
+
+  const perdida = await db.execute({
+    sql: 'SELECT status FROM live_matches WHERE code = ? ORDER BY id DESC LIMIT 1', args: [LOBBY],
+  });
+  check("lobby finalizado → partida vira 'encerrada' (não 'abandonada')",
+    perdida.rows[0][0] === 'encerrada', `status=${perdida.rows[0][0]}`);
+
+  await sleep(700);
+  check('client conectado recebeu o END_MATCH atrasado',
+    recebidas.filter((m) => m.type === 'END_MATCH').length > endsAntes);
+
   ws.close();
 } finally {
   await cleanup();

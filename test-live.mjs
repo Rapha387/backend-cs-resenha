@@ -42,10 +42,15 @@ async function cleanup(matchId) {
   await db.batch(stmts, 'write');
 }
 
+// Relógio estritamente crescente: a agregação usa MAX(ts) pra achar o sync
+// mais recente, e Date.now() empataria entre inserts do mesmo milissegundo.
+let relogio = Date.now();
+const proximoTs = () => ++relogio;
+
 // grava um STATE_SYNC como se viesse do client daquele jogador
-const sync = (matchId, steamid, state) => ({
+const sync = (matchId, steamid, state, ts = proximoTs()) => ({
   sql: 'INSERT INTO match_events (match_id, steamid, type, ts, data) VALUES (?, ?, ?, ?, ?)',
-  args: [matchId, steamid, 'STATE_SYNC', Date.now(), JSON.stringify(state)],
+  args: [matchId, steamid, 'STATE_SYNC', ts, JSON.stringify(state)],
 });
 
 let matchId = null;
@@ -98,6 +103,26 @@ try {
   check('jogador morto (health 0)', a2.health === 0);
   check('todos no jogo', t1.data.players.every((p) => p.no_jogo));
   check('ainda não terminou', t1.data.finished === false);
+
+  // Morreu e está assistindo um colega: o GSI troca o bloco "player" pelo
+  // jogador OBSERVADO, então o client manda player:null (as stats não são
+  // dele). O K/D/A do A1 não pode sumir da tela por causa disso — ele
+  // continua no jogo, morto, com os números do último sync que era dele.
+  await db.batch([
+    sync(matchId, A1, { map: 'de_mirage', round: 12, round_phase: 'live', map_phase: 'live',
+      score_ct: 9, score_t: 4, player: null }),
+  ], 'write');
+
+  const espec = await get(`/internal/lobby/${LOBBY}/state`);
+  const a1Espec = espec.data.players.find((p) => p.steamid === A1);
+  check('espectando: continua no jogo', a1Espec.no_jogo === true);
+  check('espectando: K/D/A preservado', a1Espec.kills === 14 && a1Espec.deaths === 8 && a1Espec.assists === 3,
+    `${a1Espec.kills}/${a1Espec.deaths}/${a1Espec.assists}`);
+  check('espectando: marcado como morto', a1Espec.health === 0);
+  check('espectando: lado preservado', a1Espec.side === 'CT' && espec.data.lado_a === 'CT');
+  check('espectando: placar continua traduzido A=9 B=4',
+    espec.data.score_a === 9 && espec.data.score_b === 4,
+    `A=${espec.data.score_a} B=${espec.data.score_b}`);
 
   // Segundo tempo: lados trocados. CS2 diz 11 CT × 13 T, mas agora o time A é T
   // → o placar do time A tem que ser 13, não 11.

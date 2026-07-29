@@ -56,7 +56,21 @@ const SCHEMA = [
     ts INTEGER,
     data TEXT
   )`,
-  `CREATE INDEX IF NOT EXISTS idx_match_events_match ON match_events (match_id, steamid, type)`,
+
+  // ---- Índices ----
+  // As consultas quentes do liveState filtram (match_id, type) e agregam
+  // MAX(ts) por steamid — (match_id, type, steamid, ts) atende as três:
+  // STATE_SYNC por jogador, STATE_SYNC próprio e GAME_OVER ORDER BY ts.
+  // O índice antigo (match_id, steamid, type) tinha o type no fim, então
+  // toda leitura varria os eventos de TODOS os tipos da partida.
+  `DROP INDEX IF EXISTS idx_match_events_match`,
+  `CREATE INDEX IF NOT EXISTS idx_match_events_lookup ON match_events (match_id, type, steamid, ts)`,
+  // startMatch/endMatch/liveStateByCode buscam por code (a tabela guarda o
+  // histórico inteiro); a varredura busca por status + started.
+  `CREATE INDEX IF NOT EXISTS idx_live_matches_code ON live_matches (code, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_live_matches_status ON live_matches (status, started)`,
+  // Faxina de sessões vencidas a cada pareamento.
+  `CREATE INDEX IF NOT EXISTS idx_client_sessions_refresh_expires ON client_sessions (refresh_expires)`,
 ];
 
 let _schema = null;

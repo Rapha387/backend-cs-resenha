@@ -143,6 +143,7 @@ try {
   await sleep(700);
   const state = await req(`/internal/match/${start.data.matchId}/state`, { method: 'GET', headers: { 'X-Internal-Key': KEY } });
   check('match/:id/state agrega STATE_SYNC', state.status === 200 && state.data.players?.length === 1);
+  check('client conectado → client_online', state.data.players[0].client_online === true);
 
   // end + notificação
   const end = await req('/internal/match/end', { body: { code: LOBBY }, headers: { 'X-Internal-Key': KEY } });
@@ -151,7 +152,12 @@ try {
   const endMsgs = conn.messages.filter((m) => m.type === 'END_MATCH');
   check('client recebeu END_MATCH', endMsgs.length >= 2); // 1 do resync inicial + 1 do end
 
+  // Queda curta do WS (backend reiniciando, wi-fi oscilando) não pode acender
+  // o aviso "Resenha Client fechado" pra sala inteira — ver TOLERANCIA_MS.
   conn.ws.close();
+  await sleep(2300); // > CACHE_MS do liveState, senão a resposta vem do cache
+  const caiu = await req(`/internal/match/${start.data.matchId}/state`, { method: 'GET', headers: { 'X-Internal-Key': KEY } });
+  check('queda curta não vira "client fechado"', caiu.data.players[0].client_online === true);
 } finally {
   await cleanup();
   console.log(falhas === 0 ? '\n🎉 tudo passou' : `\n💥 ${falhas} falha(s)`);

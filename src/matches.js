@@ -87,11 +87,36 @@ async function activeMatchFor(steamid) {
  * a coleta. Roda no boot e de hora em hora.
  */
 export async function encerrarPartidasAbandonadas() {
+  // Caso 1 — END_MATCH perdido na hibernação: o placar já foi registrado no
+  // site (lobby 'finalizado'), mas o /internal/match/end não chegou porque o
+  // backend estava dormindo (plano free do Render) e o cold start estourou o
+  // timeout do site. Como o banco é compartilhado, dá pra detectar por aqui.
+  // A varredura roda no boot — ou seja, TODA acordada do backend recupera
+  // esses casos sem esperar a rede de segurança de 4h.
+  const perdidas = await db.prepare(`
+    SELECT lm.id, lm.code FROM live_matches lm
+    JOIN lobbies l ON l.code = lm.code
+    WHERE lm.status = 'ativa' AND l.status = 'finalizado'`).all();
+  if (perdidas.length > 0) {
+    await db.batch(perdidas.map((m) => ({
+      sql: "UPDATE live_matches SET status = 'encerrada', ended = ? WHERE id = ?",
+      args: [Date.now(), m.id],
+    })));
+    for (const m of perdidas) {
+      for (const p of await lobbyPlayers(m.code)) {
+        activeBySteamid.set(p.steamid, null);
+        sendTo(p.steamid, { type: 'END_MATCH' });
+      }
+    }
+    log(`${perdidas.length} partida(s) com END_MATCH perdido encerrada(s): ${perdidas.map((m) => m.code).join(', ')}`);
+  }
+
+  // Caso 2 — partida sem placar registrado que passou do tempo máximo.
   const limite = Date.now() - MAX_DURACAO_MS;
   const velhas = await db.prepare(
     "SELECT id, code FROM live_matches WHERE status = 'ativa' AND started <= ?"
   ).all(limite);
-  if (velhas.length === 0) return 0;
+  if (velhas.length === 0) return perdidas.length;
 
   await db.batch(velhas.map((m) => ({
     sql: "UPDATE live_matches SET status = 'abandonada', ended = ? WHERE id = ?",
@@ -105,7 +130,7 @@ export async function encerrarPartidasAbandonadas() {
     }
   }
   log(`${velhas.length} partida(s) abandonada(s) encerrada(s): ${velhas.map((m) => m.code).join(', ')}`);
-  return velhas.length;
+  return perdidas.length + velhas.length;
 }
 
 /** Contrato do client: após o HELLO, reenviamos o estado atual. */
@@ -185,10 +210,21 @@ async function buildLiveState(matchId) {
   const match = await db.prepare('SELECT * FROM live_matches WHERE id = ?').get(matchId);
   if (!match) throw new HttpError(404, 'Partida não encontrada.');
 
-  const [syncs, roster, over] = await Promise.all([
+  const [syncs, ownSyncs, roster, over] = await Promise.all([
     db.prepare(`
       SELECT steamid, data, MAX(ts) AS ts FROM match_events
       WHERE match_id = ? AND type = 'STATE_SYNC' GROUP BY steamid`).all(matchId),
+    // Quando a pessoa morre e passa a assistir um colega, o GSI troca o bloco
+    // "player" pelo jogador OBSERVADO — e o client manda player:null, porque
+    // aquelas stats não são dela (events.rs). Esses syncs são ~20% do total.
+    // Se o K/D/A saísse do sync mais recente, ele sumiria da tela a cada morte
+    // ("fora do jogo") e só voltaria no respawn. Por isso as stats de cada um
+    // vêm do último sync em que o bloco "player" era dele mesmo.
+    db.prepare(`
+      SELECT steamid, data, MAX(ts) AS ts FROM match_events
+      WHERE match_id = ? AND type = 'STATE_SYNC'
+        AND json_extract(data, '$.player') IS NOT NULL
+      GROUP BY steamid`).all(matchId),
     db.prepare(`
       SELECT lp.steamid, lp.team, p.name, p.avatar
       FROM lobby_players lp LEFT JOIN players p ON p.steamid = lp.steamid
@@ -199,6 +235,7 @@ async function buildLiveState(matchId) {
   ]);
 
   const syncByPlayer = new Map(syncs.map((r) => [r.steamid, { ts: r.ts, state: parse(r.data) }]));
+  const ownByPlayer = new Map(ownSyncs.map((r) => [r.steamid, { ts: r.ts, state: parse(r.data) }]));
 
   // Contexto global: o STATE_SYNC mais recente (todos veem o mesmo placar).
   let latest = null;
@@ -209,7 +246,12 @@ async function buildLiveState(matchId) {
 
   const players = roster.map((p) => {
     const sync = syncByPlayer.get(p.steamid);
-    const ps = sync?.state?.player ?? null;
+    const own = ownByPlayer.get(p.steamid);
+    const ps = own?.state?.player ?? null;
+    // O sync mais recente veio sem bloco próprio, mas já houve um antes: a
+    // pessoa está assistindo um colega, ou seja, morta neste round. O health
+    // do sync antigo é de quando ela ainda estava viva — não vale mais.
+    const espectando = Boolean(ps) && Boolean(sync?.state) && !sync.state.player;
     return {
       steamid: p.steamid,
       name: p.name,
@@ -221,7 +263,7 @@ async function buildLiveState(matchId) {
       // dados (senão ela ainda não entrou na partida).
       client_online: isConnected(p.steamid),
       no_jogo: Boolean(ps),
-      health: ps?.health ?? null,
+      health: espectando ? 0 : (ps?.health ?? null),
       kills: ps?.kills ?? null,
       deaths: ps?.deaths ?? null,
       assists: ps?.assists ?? null,
