@@ -12,6 +12,7 @@ import { pair, refresh, HttpError } from './auth.js';
 import { startMatch, endMatch, liveState, liveStateByCode, encerrarPartidasAbandonadas } from './matches.js';
 import { attachWebSocket, connectedCount } from './ws.js';
 import { rateLimit } from './ratelimit.js';
+import { CLIENT_LATEST, CLIENT_DOWNLOAD_URL } from './version.js';
 import { log } from './log.js';
 
 const PORT = Number(process.env.PORT) || 4000;
@@ -99,6 +100,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && pathname === '/internal/sweep') {
       requireInternalKey(req);
       return json(res, 200, { encerradas: await encerrarPartidasAbandonadas() });
+    }
+    if (req.method === 'GET' && pathname === '/api/client/version') {
+      // Público e barato: o client consulta no boot pra saber se está atual.
+      return json(res, 200, { version: CLIENT_LATEST, url: CLIENT_DOWNLOAD_URL });
     }
     if (req.method === 'GET' && pathname === '/health') {
       return json(res, 200, { ok: true, clients: connectedCount() });

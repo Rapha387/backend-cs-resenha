@@ -5,6 +5,7 @@
 //   node --env-file=.env test-abandonada.mjs
 import { createClient } from '@libsql/client';
 import WebSocket from 'ws';
+import { CLIENT_LATEST } from './src/version.js';
 
 const BASE = process.env.TEST_BASE_URL || 'http://localhost:4000';
 const KEY = process.env.INTERNAL_API_KEY;
@@ -64,7 +65,7 @@ try {
   await new Promise((resolve) => ws.on('open', resolve));
   ws.on('message', (raw) => recebidas.push(JSON.parse(raw.toString())));
 
-  ws.send(JSON.stringify({ type: 'HELLO', client: 'test', version: '0' }));
+  ws.send(JSON.stringify({ type: 'HELLO', client: 'test', version: CLIENT_LATEST }));
   await sleep(1000);
   check('resync ignora partida velha → END_MATCH', recebidas.some((m) => m.type === 'END_MATCH'));
   check('resync não reativa a coleta', !recebidas.some((m) => m.type === 'START_MATCH'));

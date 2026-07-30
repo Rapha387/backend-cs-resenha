@@ -63,7 +63,27 @@ GAME_OVER chega do CS2 ──▶ registro automático do placar:
 | `GET /internal/match/:id/state` | `X-Internal-Key` | estado ao vivo agregado (placar já traduzido pros times A/B + K/D/A por jogador) |
 | `GET /internal/lobby/:code/state` | `X-Internal-Key` | igual ao anterior, mas pelo código do lobby (é o que o site usa) |
 | `POST /internal/sweep` | `X-Internal-Key` | encerra partidas abandonadas na hora (roda sozinho de hora em hora) |
+| `GET /api/client/version` | — | versão atual do client + link do instalador |
 | `GET /health` | — | liveness + nº de clients conectados |
+
+## Versão do Resenha Client
+
+O backend é a **fonte de verdade** da versão. Client mais antigo que
+`CLIENT_LATEST_VERSION` recebe `UPDATE_REQUIRED` no HELLO, tem a conexão
+encerrada e **não coleta nada** até o usuário instalar a versão nova (a UI do
+app trava numa tela de atualização). Isso garante que ninguém fica jogando com
+um client que grava evento em formato antigo.
+
+Pra lançar uma versão:
+
+```bash
+cd ../resenha-client && node release.mjs 0.3.0   # bump + build + copia pro site
+```
+
+Depois suba `CLIENT_LATEST_VERSION=0.3.0` no Render e faça deploy do site (que
+serve o instalador em `/client/ResenhaClient-setup.exe`). A ordem importa:
+**site primeiro** (pro link novo existir), backend depois (é ele que torna a
+atualização obrigatória).
 
 ## Garantias implementadas (contrato do client)
 

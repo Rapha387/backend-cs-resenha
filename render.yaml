@@ -22,3 +22,10 @@ services:
         sync: false
       - key: INTERNAL_API_KEY
         sync: false
+      # Versão atual do Resenha Client — client mais antigo é bloqueado até
+      # atualizar. Dá pra subir por aqui sem redeploy do código.
+      - key: CLIENT_LATEST_VERSION
+        sync: false
+      # Link absoluto do instalador no site (botão "Baixar atualização").
+      - key: CLIENT_DOWNLOAD_URL
+        sync: false

@@ -3,6 +3,7 @@
 import { WebSocketServer } from 'ws';
 import { sessionFromAuthHeader } from './auth.js';
 import { resync, handleClientEvent } from './matches.js';
+import { CLIENT_LATEST, CLIENT_DOWNLOAD_URL, versaoMenor } from './version.js';
 import { log } from './log.js';
 
 // steamid -> Set<ws> (o mesmo jogador pode ter mais de uma conexão durante
@@ -19,14 +20,15 @@ const lastSeen = new Map();
 // quem esqueceu de abrir o app, não pra piscar a cada reconexão.
 const TOLERANCIA_MS = 45_000;
 
-/** Envia um objeto pra todas as conexões de um jogador. Retorna quantas. */
+/** Envia um objeto pra todas as conexões ATIVAS de um jogador. Retorna quantas. */
 export function sendTo(steamid, obj) {
   const sockets = clients.get(steamid);
   if (!sockets || sockets.size === 0) return 0;
   const payload = JSON.stringify(obj);
   let sent = 0;
   for (const ws of sockets) {
-    if (ws.readyState === ws.OPEN) {
+    // Conexão bloqueada por versão nunca recebe comando (START_MATCH etc.).
+    if (ws.readyState === ws.OPEN && !ws.bloqueado) {
       ws.send(payload);
       sent++;
     }
@@ -46,8 +48,10 @@ export function connectedCount() {
  * o client reenvia o estado assim que volta.
  */
 export function isConnected(steamid) {
+  // Client bloqueado por versão não conta como conectado: ele realmente não
+  // vai registrar nada, e o site precisa avisar isso na tela do lobby.
   const set = clients.get(steamid);
-  if (set) for (const ws of set) if (ws.readyState === ws.OPEN) return true;
+  if (set) for (const ws of set) if (ws.readyState === ws.OPEN && !ws.bloqueado) return true;
   const visto = lastSeen.get(steamid);
   return visto !== undefined && Date.now() - visto < TOLERANCIA_MS;
 }
@@ -88,13 +92,17 @@ export function attachWebSocket(server) {
     log(`client conectado: ${steamid} (${connectedCount()} conexões no total)`);
 
     ws.isAlive = true;
+    // Vira true no HELLO se a versão for antiga: a conexão continua aberta
+    // (ver handleMessage) mas não recebe comandos nem grava evento nenhum.
+    ws.bloqueado = false;
+
     ws.on('pong', () => {
       ws.isAlive = true;
-      lastSeen.set(steamid, Date.now());
+      if (!ws.bloqueado) lastSeen.set(steamid, Date.now());
     });
 
     ws.on('message', async (raw) => {
-      lastSeen.set(steamid, Date.now());
+      if (!ws.bloqueado) lastSeen.set(steamid, Date.now());
       let msg;
       try {
         msg = JSON.parse(raw.toString());
@@ -141,9 +149,31 @@ export function attachWebSocket(server) {
 }
 
 async function handleMessage(steamid, msg, ws) {
+  // Conexão bloqueada por versão: inerte. Só o HELLO é processado (pra
+  // reavisar), todo o resto é descartado antes de tocar no banco.
+  if (ws.bloqueado && msg.type !== 'HELLO') return;
+
   switch (msg.type) {
     case 'HELLO':
       log(`HELLO de ${steamid} (client v${msg.version ?? '?'})`);
+      // Portão de versão: client desatualizado não opera — sem resync, sem
+      // receber START_MATCH e sem gravar evento nenhum.
+      //
+      // A conexão NÃO é fechada de propósito: o client 0.1.0 (que já está
+      // instalado nas máquinas e não conhece UPDATE_REQUIRED) trata o close
+      // como queda e reconecta com backoff 1s, o que viraria um martelo de
+      // uma conexão por segundo por pessoa — cada uma consultando a sessão
+      // no Turso e segurando o Render free acordado. Deixando aberta, ele
+      // fica parado. O client novo fecha sozinho ao receber o aviso.
+      if (versaoMenor(msg.version, CLIENT_LATEST)) {
+        ws.bloqueado = true;
+        lastSeen.delete(steamid);
+        log(`client de ${steamid} desatualizado (v${msg.version ?? '?'} < v${CLIENT_LATEST}) — bloqueado`);
+        ws.send(JSON.stringify({ type: 'UPDATE_REQUIRED', latest: CLIENT_LATEST, url: CLIENT_DOWNLOAD_URL }));
+        return;
+      }
+      // Reconectou já atualizado numa conexão antes marcada? Libera.
+      ws.bloqueado = false;
       // Ressincronização obrigatória do contrato: reenvia o estado atual
       // (START_MATCH se tem partida ativa, END_MATCH se não tem).
       await resync(steamid);

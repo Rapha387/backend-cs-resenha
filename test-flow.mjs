@@ -5,6 +5,7 @@
 // site) e limpa tudo que criou no final.
 import { createClient } from '@libsql/client';
 import WebSocket from 'ws';
+import { CLIENT_LATEST } from './src/version.js';
 
 const BASE = process.env.TEST_BASE_URL || 'http://localhost:4000';
 const WS_URL = BASE.replace(/^http/, 'ws') + '/ws/client';
@@ -101,9 +102,19 @@ try {
   // WS autenticado + HELLO → resync END_MATCH (sem partida ativa)
   const conn = await wsConnect(ref.data.access_token);
   check('WS autenticado conecta', conn.status === 101);
-  conn.ws.send(JSON.stringify({ type: 'HELLO', client: 'test', version: '0' }));
+  conn.ws.send(JSON.stringify({ type: 'HELLO', client: 'test', version: CLIENT_LATEST }));
   await sleep(700);
   check('resync sem partida → END_MATCH', conn.messages.some((m) => m.type === 'END_MATCH'));
+
+  // ---- Portão de versão: client velho não opera ----
+  const versao = await req('/api/client/version', { method: 'GET' });
+  check('GET /api/client/version', versao.status === 200 && versao.data.version === CLIENT_LATEST,
+    `version=${versao.data.version}`);
+
+  // Cada refresh rotaciona os dois tokens: `tokens` guarda o par vivo pro
+  // resto do teste (a conexão `conn` original segue válida — o backend não
+  // derruba sessão já autenticada quando o token é rotacionado).
+  const tokens = (await req('/api/client/auth/refresh', { body: { refresh_token: ref.data.refresh_token } })).data;
 
   // partida: cria lobby falso e dispara start
   await db.batch([
@@ -118,6 +129,53 @@ try {
   // idempotência do start
   const start2 = await req('/internal/match/start', { body: { code: LOBBY }, headers: { 'X-Internal-Key': KEY } });
   check('match/start repetido → mesmo matchId', start2.data.matchId === start.data.matchId);
+
+  // ---- Cenário real do portão: partida rolando e alguém abre o client velho ----
+  // Fecha a conexão boa antes: o teste é sobre um jogador cujo ÚNICO client
+  // é o desatualizado (com as duas abertas, o site veria o bom e diria online).
+  conn.ws.close();
+  await sleep(300);
+  const connVelho = await wsConnect(tokens.access_token);
+  connVelho.ws.send(JSON.stringify({ type: 'HELLO', client: 'test', version: '0.0.1' }));
+  await sleep(800);
+  check('client desatualizado → UPDATE_REQUIRED',
+    connVelho.messages.some((m) => m.type === 'UPDATE_REQUIRED' && m.latest === CLIENT_LATEST));
+  check('client desatualizado NÃO recebe START_MATCH (partida ativa)',
+    !connVelho.messages.some((m) => m.type === 'START_MATCH'));
+  // Aberta de propósito: fechar faria o client 0.1.0 (que não conhece
+  // UPDATE_REQUIRED) reconectar em loop de 1s. Ver handleMessage em ws.js.
+  check('conexão do client velho fica aberta (sem loop de reconexão)',
+    connVelho.ws.readyState === WebSocket.OPEN);
+
+  // Inerte mesmo sabendo o matchId certo (ele podia ter guardado de antes).
+  const antesDoVelho = await db.execute({
+    sql: 'SELECT COUNT(*) c FROM match_events WHERE match_id = ?', args: [start.data.matchId],
+  });
+  connVelho.ws.send(JSON.stringify({
+    type: 'STATE_SYNC', matchId: start.data.matchId, timestamp: Date.now(),
+    data: { map: 'de_dust2', score_ct: 5, score_t: 5 },
+  }));
+  await sleep(700);
+  const depoisDoVelho = await db.execute({
+    sql: 'SELECT COUNT(*) c FROM match_events WHERE match_id = ?', args: [start.data.matchId],
+  });
+  check('evento de client bloqueado não é gravado (nem com matchId válido)',
+    Number(depoisDoVelho.rows[0][0]) === Number(antesDoVelho.rows[0][0]));
+
+  const stateVelho = await req(`/internal/match/${start.data.matchId}/state`, { method: 'GET', headers: { 'X-Internal-Key': KEY } });
+  check('client bloqueado aparece como offline pro site',
+    stateVelho.data.players[0].client_online === false);
+
+  // Volta ao normal: fecha o velho e reconecta atualizado pro resto do teste.
+  connVelho.ws.close();
+  await sleep(300);
+  const connOk = await wsConnect(tokens.access_token);
+  connOk.ws.send(JSON.stringify({ type: 'HELLO', client: 'test', version: CLIENT_LATEST }));
+  await sleep(700);
+  check('client atualizado reconecta e recebe START_MATCH da partida ativa',
+    connOk.messages.some((m) => m.type === 'START_MATCH' && m.matchId === start.data.matchId));
+  conn.ws = connOk.ws;
+  conn.messages = connOk.messages;
 
   // evento do client é gravado
   conn.ws.send(JSON.stringify({
@@ -151,8 +209,10 @@ try {
   const end = await req('/internal/match/end', { body: { code: LOBBY }, headers: { 'X-Internal-Key': KEY } });
   check('match/end', end.status === 200 && end.data.matchId === start.data.matchId);
   await sleep(700);
+  // Esta conexão pegou START_MATCH no resync (a partida estava ativa), então
+  // qualquer END_MATCH aqui veio do /internal/match/end.
   const endMsgs = conn.messages.filter((m) => m.type === 'END_MATCH');
-  check('client recebeu END_MATCH', endMsgs.length >= 2); // 1 do resync inicial + 1 do end
+  check('client recebeu END_MATCH', endMsgs.length >= 1);
 
   // Queda curta do WS (backend reiniciando, wi-fi oscilando) não pode acender
   // o aviso "Resenha Client fechado" pra sala inteira — ver TOLERANCIA_MS.
@@ -168,7 +228,7 @@ try {
     sql: 'INSERT INTO players (steamid, name, elo, wins, losses, created) VALUES (?, ?, 1000, 0, 0, ?)',
     args: [STEAMID, 'Testador', Date.now()],
   });
-  const conn2 = await wsConnect(ref.data.access_token);
+  const conn2 = await wsConnect(tokens.access_token);
   check('WS reconecta pro teste de registro', conn2.status === 101);
 
   const start3 = await req('/internal/match/start', { body: { code: LOBBY }, headers: { 'X-Internal-Key': KEY } });
