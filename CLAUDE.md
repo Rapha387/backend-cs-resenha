@@ -56,6 +56,30 @@ src/
 - **Nada depende do backend estar acordado.** Ele hiberna; chamadas do site
   falham em silêncio e são recuperadas pelo polling ou pela varredura.
 
+## Princípios e padrões
+
+Clean Code, SOLID, DRY, KISS e YAGNI — **até onde pagam**.
+
+- **S**: `matches/` é o exemplo canônico — `lifecycle` liga/desliga a coleta,
+  `live-state` **só lê**, `scoring` **só escreve** resultado, `sweep` recupera,
+  `events` recebe. Era um arquivo de 430 linhas fazendo as cinco coisas.
+- **O**: `http/routes.js` é tabela — rota nova = uma linha, sem tocar no
+  roteador.
+- **I**: o domínio conhece do WebSocket apenas `ws/registry.js`
+  (`sendTo`, `isConnected`), nunca o servidor.
+- **DRY** vale para duplicação **real**; semelhança coincidente que muda por
+  motivos diferentes fica separada.
+- **YAGNI**: a escala real é uma sala de 10 jogadores. Não construa para 10 mil.
+
+**Adotados:** fachada (`matches/index.js`), tabela de despacho
+(`http/routes.js`), registry (`ws/registry.js`), guard clauses, idempotência
+em toda operação exposta.
+
+**Rejeitados de propósito** — não reintroduza sem argumentar o ganho concreto:
+**Repository Pattern** (há um banco só e os testes são de integração contra
+ele) e **Service Layer** (as rotas têm ~20 linhas de regra; a camada extra só
+adiciona salto de arquivo).
+
 ## Regras deste projeto
 
 - **Rota nova = uma linha em `http/routes.js`.** Não mexa no roteador.
