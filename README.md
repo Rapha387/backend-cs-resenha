@@ -46,7 +46,9 @@ veto termina (status 'pronto')
                                       grava em match_events
 
 GAME_OVER chega do CS2 ──▶ registro automático do placar:
-                             elo/W-L nos players, histórico em matches,
+                             RRS calcula o Δelo de cada jogador (resultado +
+                             desempenho), elo/W-L nos players, histórico em
+                             matches, abertura do cálculo em match_player_stats,
                              lobby vira 'finalizado', encerra live_match
                           ──▶ END_MATCH ──────────────────────▶  volta ao modo espera
 ```
@@ -101,7 +103,60 @@ atualização obrigatória).
 
 - `client_sessions` — tokens do client (opacos, rotacionados; apagar a linha = revogar)
 - `live_matches` — partidas em andamento (`id` é o `matchId` do client)
-- `match_events` — eventos crus (`ROUND_END`, `PLAYER_KILL`, `STATE_SYNC`…)
+- `match_events` — eventos crus (`ROUND_END`, `PLAYER_KILL`, `STATE_SYNC`…).
+  **Só entra o que alguém lê**: o placar ao vivo (`live-state.js`) e o cálculo do
+  elo (`rrs/timeline.js`). O client manda mais do que isso — `MAP_CHANGE`,
+  `MAP_PHASE`, `SCORE_UPDATE`, `PLAYER_ALIVE`, `PLAYER_TEAM` e `BOMB_EXPLODED`
+  são aceitos e descartados em silêncio (a informação toda já está no
+  `STATE_SYNC`), e de `WEAPON_CHANGE` só a `weapon_c4` é gravada, porque é ela
+  que atribui o plant. Em 7 partidas reais, troca de arma era **62% da tabela**
+  e 96% disso era faca, rifle e pistola que ninguém consumia.
+- `match_player_stats` — abertura do cálculo do elo por jogador (ver RRS abaixo).
+  **DDL idêntica no `lib/db.js` do site**, que lê a tabela para explicar o resultado.
+
+## RRS — quanto de elo cada partida vale
+
+Quem decide a variação de elo é `matches/rrs/`, no `GAME_OVER`:
+
+```
+Δelo = s · 0,60·K  +  0,40·K · q
+       └ resultado ┘  └ desempenho ┘
+```
+
+- `s` = +1 se o time venceu, −1 se perdeu;
+- `K` = amplitude do formato — 25 no 5x5, 22 no 4x4, 20 no 3x3, 15 abaixo disso;
+- `q` = fator de desempenho em [−1, +1], derivado do **PIS** (Player Impact
+  Score, 0–100) do jogador naquela partida.
+
+Como o componente de resultado (0,60·K) é maior que o de desempenho (0,40·K),
+**derrota nunca vira ganho**: desempenho excepcional numa derrota reduz a perda
+de −25 para −5, e nunca a inverte. No 5x5 a amplitude máxima continua sendo os
+±25 do sistema antigo.
+
+O PIS é a média ponderada de sete métricas (KAST, impacto de abates, entry,
+trade, clutch, MVP e objetivo), cada uma normalizada contra uma referência
+fixa **e** contra os outros jogadores da própria partida. **Não há ADR: o CS2
+não expõe dano** — medimos 27 payloads de uma partida ao vivo e o
+`player.state` traz `round_kills` e `round_killhs`, mas nenhum campo de dano
+(o `round_totaldmg` é do CS:GO). Sem ele, KAST é o maior peso, com 28,2%. O peso do
+percentil cresce com o tamanho da partida, porque num 2x2 ele só produziria
+0, 33, 67 e 100.
+
+**Cobertura manda no que é calculado.** Métrica que depende de cruzar as
+máquinas (KAST, entry, trade, clutch, objetivo) só entra com 80% dos jogadores
+reportando; clutch exige 100%, porque "último vivo" com gente invisível é
+palpite. Abaixo de 60% ninguém tem desempenho e a partida vale só o resultado
+(±0,6·K). Entre 60% e 79% sobram IMP e MVP, as duas derivadas de abate — nessa
+faixa o desempenho **vale metade** (mexe ±0,2·K), senão o elo viraria ranking
+de fragger, que é o oposto do objetivo.
+
+Quem não tem dados fica com `q = 0` e leva **apenas** o componente de
+resultado. Não é punição: sem client o jogador não perde mais que os outros,
+só não acessa o topo da faixa.
+
+Cada linha de `match_player_stats` guarda os contadores crus, o PIS, o `q`, o
+Δelo e o JSON das notas por métrica — é o que permite explicar depois por que
+um jogador levou +19 e o companheiro +13.
 
 ## Placar ao vivo
 
@@ -120,6 +175,7 @@ no lobby e guarda a chave interna no servidor).
 node --env-file=.env test-flow.mjs        # pareamento, tokens, WS, START/END_MATCH
 node --env-file=.env test-live.mjs        # agregação do placar, inclusive troca de lado
 node --env-file=.env test-abandonada.mjs  # rede de segurança contra END_MATCH perdido
+node --env-file=.env test-rrs.mjs         # métricas, PIS e elo (cobertura total e parcial)
 ```
 
 Todos usam steamids falsos (`7656119800000000…`) e limpam tudo no final.

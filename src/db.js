@@ -68,6 +68,22 @@ const SCHEMA = [
     ts INTEGER,
     data TEXT
   )`,
+  // Abertura do cálculo do RRS por jogador (o site lê para explicar o elo).
+  // DDL idêntica em lib/db.js do site — quem subir primeiro cria.
+  // pis/q/metricas ficam NULL quando o jogador não teve dados suficientes.
+  `CREATE TABLE IF NOT EXISTS match_player_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id INTEGER NOT NULL,
+    code TEXT NOT NULL,
+    steamid TEXT NOT NULL,
+    rounds INTEGER,
+    kills INTEGER, assists INTEGER, deaths INTEGER,
+    kast_rounds INTEGER, ek INTEGER, ed INTEGER, tk INTEGER,
+    clutch_pts REAL, mvps INTEGER, plants INTEGER, defuses INTEGER,
+    pis REAL, q REAL, delta_elo INTEGER,
+    metricas TEXT,
+    created INTEGER
+  )`,
 
   // ---- Índices ----
   // As consultas quentes do liveState filtram (match_id, type) e agregam
@@ -83,6 +99,11 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS idx_live_matches_status ON live_matches (status, started)`,
   // Faxina de sessões vencidas a cada pareamento.
   `CREATE INDEX IF NOT EXISTS idx_client_sessions_refresh_expires ON client_sessions (refresh_expires)`,
+  // Único: o retry da varredura reprocessa a mesma partida, e o INSERT OR
+  // IGNORE do registro depende deste índice pra não duplicar a linha.
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_mps_unico ON match_player_stats (match_id, steamid)`,
+  // Teto diário: soma do delta_elo do jogador no dia.
+  `CREATE INDEX IF NOT EXISTS idx_mps_steamid_created ON match_player_stats (steamid, created)`,
 ];
 
 let _schema = null;

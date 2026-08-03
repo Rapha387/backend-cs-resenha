@@ -37,6 +37,7 @@ async function cleanup(matchId) {
     { sql: 'DELETE FROM lobbies WHERE code = ?', args: [LOBBY] },
     { sql: 'DELETE FROM live_matches WHERE code = ?', args: [LOBBY] },
     { sql: 'DELETE FROM matches WHERE code = ?', args: [LOBBY] },
+    { sql: 'DELETE FROM match_player_stats WHERE code = ?', args: [LOBBY] },
     { sql: 'DELETE FROM players WHERE steamid IN (?, ?, ?)', args: [A1, A2, B1] },
   ];
   if (matchId) stmts.push({ sql: 'DELETE FROM match_events WHERE match_id = ?', args: [matchId] });
@@ -166,9 +167,16 @@ try {
     args: [A1, A2, B1],
   });
   const porId = new Map(elos.rows.map((r) => [r[0], { elo: Number(r[1]), w: Number(r[2]), l: Number(r[3]) }]));
-  check('time A ganhou +25 de elo', porId.get(A1).elo === 1025 && porId.get(A2).elo === 1025
-    && porId.get(A1).w === 1 && porId.get(A2).w === 1);
-  check('time B perdeu 25 de elo', porId.get(B1).elo === 975 && porId.get(B1).l === 1);
+  // Este teste manda só alguns STATE_SYNC soltos, então ninguém observou
+  // rounds suficientes pro RRS calcular desempenho: todos ficam com q = 0 e
+  // a partida vale apenas o componente de resultado, ±0,6·K. Com 3 jogadores
+  // o K é 15 → ±9. O desempenho em si é coberto pelo test-rrs.mjs.
+  check('time A ganhou +9 de elo (só componente de resultado)',
+    porId.get(A1).elo === 1009 && porId.get(A2).elo === 1009
+    && porId.get(A1).w === 1 && porId.get(A2).w === 1,
+    `A1=${porId.get(A1).elo} A2=${porId.get(A2).elo}`);
+  check('time B perdeu 9 de elo', porId.get(B1).elo === 991 && porId.get(B1).l === 1,
+    `B1=${porId.get(B1).elo}`);
 
   const reg = await db.execute({ sql: 'SELECT score_a, score_b, winner FROM matches WHERE code = ?', args: [LOBBY] });
   check('histórico em matches (13x11, vencedor A)',
@@ -181,7 +189,8 @@ try {
   await fetch(`${BASE}/internal/sweep`, { method: 'POST', headers: { 'X-Internal-Key': KEY } });
   const reg2 = await db.execute({ sql: 'SELECT COUNT(*) c FROM matches WHERE code = ?', args: [LOBBY] });
   const elo2 = await db.execute({ sql: 'SELECT elo FROM players WHERE steamid = ?', args: [A1] });
-  check('varredura repetida não duplica registro', Number(reg2.rows[0][0]) === 1 && Number(elo2.rows[0][0]) === 1025);
+  check('varredura repetida não duplica registro', Number(reg2.rows[0][0]) === 1 && Number(elo2.rows[0][0]) === 1009,
+    `matches=${reg2.rows[0][0]} elo=${elo2.rows[0][0]}`);
 
   // Lobby sem partida → 404 (o site trata como "sem placar ao vivo")
   const semPartida = await get('/internal/lobby/NAOEX/state', { fresco: false });

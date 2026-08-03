@@ -11,7 +11,7 @@
 //   3. sobe CLIENT_LATEST aqui (ou via env CLIENT_LATEST_VERSION no Render);
 //   4. deploy do site e do backend.
 
-export const CLIENT_LATEST = process.env.CLIENT_LATEST_VERSION || '0.2.0';
+export const CLIENT_LATEST = process.env.CLIENT_LATEST_VERSION || '0.3.0';
 
 // URL absoluta do instalador (o app desktop não sabe o endereço do site).
 // Ex.: https://resenha.vercel.app/client/ResenhaClient-setup.exe

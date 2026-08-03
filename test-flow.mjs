@@ -57,6 +57,7 @@ async function cleanup() {
     { sql: 'DELETE FROM lobby_players WHERE code = ?', args: [LOBBY] },
     { sql: 'DELETE FROM lobbies WHERE code = ?', args: [LOBBY] },
     { sql: 'DELETE FROM matches WHERE code = ?', args: [LOBBY] },
+    { sql: 'DELETE FROM match_player_stats WHERE code = ?', args: [LOBBY] },
     { sql: 'DELETE FROM players WHERE steamid = ?', args: [STEAMID] },
   ], 'write');
 }
@@ -189,6 +190,27 @@ try {
   });
   check('evento gravado em match_events', Number(saved.rows[0][0]) === 1);
 
+  // Só entra em match_events o que alguém lê. Troca de arma comum era 62% da
+  // tabela sem nenhum consumidor; a C4 fica, porque é ela que atribui o plant.
+  conn.ws.send(JSON.stringify({
+    type: 'WEAPON_CHANGE', matchId: start.data.matchId, data: { weapon: 'weapon_ak47' },
+  }));
+  conn.ws.send(JSON.stringify({
+    type: 'SCORE_UPDATE', matchId: start.data.matchId, data: { score_ct: 1, score_t: 0 },
+  }));
+  conn.ws.send(JSON.stringify({
+    type: 'WEAPON_CHANGE', matchId: start.data.matchId, data: { weapon: 'weapon_c4' },
+  }));
+  await sleep(700);
+  const filtrados = await db.execute({
+    sql: `SELECT type, json_extract(data, '$.weapon') w FROM match_events WHERE match_id = ?
+          AND type IN ('WEAPON_CHANGE', 'SCORE_UPDATE')`,
+    args: [start.data.matchId],
+  });
+  check('troca de arma comum e SCORE_UPDATE não são gravados',
+    filtrados.rows.length === 1 && filtrados.rows[0][1] === 'weapon_c4',
+    `gravados: ${filtrados.rows.map((r) => `${r[0]}/${r[1]}`).join(', ') || 'nenhum'}`);
+
   // evento com matchId errado não grava e recebe resync
   conn.ws.send(JSON.stringify({ type: 'ROUND_END', matchId: 999999, data: {} }));
   await sleep(700);
@@ -254,7 +276,11 @@ try {
   check("GAME_OVER → lobby 'finalizado' sozinho", lobFinal.rows[0][0] === 'finalizado', `status=${lobFinal.rows[0][0]}`);
 
   const jog = await db.execute({ sql: 'SELECT elo, wins, losses FROM players WHERE steamid = ?', args: [STEAMID] });
-  check('elo aplicado automaticamente (+25)', Number(jog.rows[0][0]) === 1025 && Number(jog.rows[0][1]) === 1,
+  // Um jogador só, com uns poucos eventos: o RRS não tem rounds observados
+  // suficientes pra calcular desempenho, então vale só o componente de
+  // resultado (+0,6·K, com K = 15). O cálculo completo é o test-rrs.mjs.
+  check('elo aplicado automaticamente (+9, só componente de resultado)',
+    Number(jog.rows[0][0]) === 1009 && Number(jog.rows[0][1]) === 1,
     `elo=${jog.rows[0][0]} wins=${jog.rows[0][1]}`);
 
   const reg = await db.execute({ sql: 'SELECT score_a, score_b, winner, map FROM matches WHERE code = ?', args: [LOBBY] });
